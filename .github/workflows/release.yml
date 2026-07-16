@@ -1,0 +1,211 @@
+name: Release
+
+# Runs in the PUBLIC Rlink-releases repo (Actions are free for public repos —
+# the private Rlink repo hit a billing/spending-limit wall). It checks out the
+# app SOURCE from the PUBLIC rlink-web repo (same code, no token needed), builds
+# signed Android + Windows + macOS, and publishes them to THIS repo's release
+# (default GITHUB_TOKEN — no cross-repo PAT). The relay job mirrors the update.
+#
+# Tag this repo `vX.Y.Z` to release. Make sure rlink-web@main is that version.
+#
+# Secrets: KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_PASSWORD, KEY_ALIAS (signing),
+# RELAY_SSH_KEY (relay mirror).
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+env:
+  SRC_REPO: MihailKashintsev/rlink-web
+  SRC_REF: main
+
+jobs:
+  build-android:
+    name: Build Android (AAB + APK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ env.SRC_REF }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.5'
+          channel: 'stable'
+          cache: false
+      - name: Decode keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/app/keystore.jks
+      - name: Create key.properties
+        run: |
+          cat > android/key.properties << EOF
+          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          keyAlias=${{ secrets.KEY_ALIAS }}
+          storeFile=keystore.jks
+          EOF
+      - name: Tune Gradle memory for CI runner
+        run: |
+          cat > android/gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -XX:ReservedCodeCacheSize=384m -XX:+HeapDumpOnOutOfMemoryError
+          android.useAndroidX=true
+          org.gradle.daemon=false
+          org.gradle.parallel=false
+          org.gradle.workers.max=2
+          EOF
+      - run: flutter pub get
+      - name: Build AAB (RuStore)
+        run: flutter build appbundle --release
+      - name: Build APK (site)
+        run: flutter build apk --release
+      - name: Rename
+        run: |
+          V="${{ github.ref_name }}"
+          cp build/app/outputs/bundle/release/app-release.aab   rlink_${V}_rustore.aab
+          cp build/app/outputs/flutter-apk/app-release.apk      Rlink-${V}.apk
+      - name: Upload to this release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Rlink ${{ github.ref_name }}"
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            rlink_*_rustore.aab
+            Rlink-*.apk
+          body: |
+            Rlink ${{ github.ref_name }}
+
+            • Android APK: `Rlink-${{ github.ref_name }}.apk` (установи, разрешив «неизвестные источники»)
+            • macOS: `rlink_${{ github.ref_name }}_macos.zip`
+            • Windows: `rlink_${{ github.ref_name }}_windows.zip`
+            • RuStore AAB: `rlink_${{ github.ref_name }}_rustore.aab`
+
+  build-windows:
+    name: Build Windows
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ env.SRC_REF }}
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.5'
+          channel: 'stable'
+          cache: false
+      - run: flutter pub get
+      - name: Pre-extract libwebrtc (avoid symlink extract failure)
+        shell: pwsh
+        run: |
+          $base = if ($env:PUB_CACHE) { $env:PUB_CACHE } else { "$env:LOCALAPPDATA\Pub\Cache" }
+          $plugin = Get-ChildItem "$base\hosted\pub.dev" -Directory -Filter "flutter_webrtc-*" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $plugin) { Write-Error "flutter_webrtc not found in pub cache ($base)"; exit 1 }
+          $tp = Join-Path $plugin.FullName "third_party"
+          $url = Select-String -Path (Join-Path $tp "CMakeLists.txt") -Pattern 'DOWNLOAD_URL "([^"]+)"' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1
+          if (-not $url) { $url = "https://github.com/flutter-webrtc/flutter-webrtc/releases/download/v1.4.0/libwebrtc.zip" }
+          Write-Host "libwebrtc url: $url  ->  $tp"
+          if (-not (Test-Path (Join-Path $tp "libwebrtc"))) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $tp "downloads") | Out-Null
+            $zip = Join-Path $tp "downloads\libwebrtc.zip"
+            Invoke-WebRequest -Uri $url -OutFile $zip
+            Expand-Archive -Path $zip -DestinationPath $tp -Force
+          }
+          Get-ChildItem $tp | Select-Object Name
+      - name: Build
+        env:
+          CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
+        run: flutter build windows --release
+      - name: ZIP
+        shell: pwsh
+        run: Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "rlink_${{ github.ref_name }}_windows.zip"
+      - name: Upload to this release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Rlink ${{ github.ref_name }}"
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: rlink_*_windows.zip
+
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ env.SRC_REF }}
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.5'
+          channel: 'stable'
+          cache: false
+      - run: flutter pub get
+      - name: Build
+        run: flutter build macos --release
+      - name: ZIP
+        run: |
+          cd build/macos/Build/Products/Release
+          zip -r "$GITHUB_WORKSPACE/rlink_${{ github.ref_name }}_macos.zip" Rlink.app
+      - name: Upload to this release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Rlink ${{ github.ref_name }}"
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: rlink_*_macos.zip
+
+  relay:
+    name: Publish update to relay (own server)
+    needs: [build-android, build-windows, build-macos]
+    if: ${{ always() && needs.build-android.result == 'success' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Pull assets from this release
+        env:
+          V: ${{ github.ref_name }}
+        run: |
+          B=https://github.com/MihailKashintsev/Rlink-releases/releases/download/$V
+          mkdir -p artifacts && cd artifacts
+          for f in "Rlink-$V.apk" "rlink_${V}_windows.zip" "rlink_${V}_macos.zip"; do
+            if curl -fsSL --retry 6 --retry-delay 3 -o "$f" "$B/$f"; then echo "got $f"; else rm -f "$f"; echo "miss $f"; fi
+          done
+          ls -lah
+      - name: Mirror to relay + regenerate manifest
+        env:
+          RELAY_SSH_KEY: ${{ secrets.RELAY_SSH_KEY }}
+          V: ${{ github.ref_name }}
+        run: |
+          if [ -z "$RELAY_SSH_KEY" ]; then echo "no RELAY_SSH_KEY — skip"; exit 0; fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$RELAY_SSH_KEY" > ~/.ssh/relay && chmod 600 ~/.ssh/relay
+          SSHOPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=25 -o ServerAliveInterval=10 -o ServerAliveCountMax=6"
+          SSH="ssh -i $HOME/.ssh/relay $SSHOPTS"
+          SCP="scp -i $HOME/.ssh/relay $SSHOPTS"
+          HOST=root@185.244.172.90
+          DIR=/var/www/rlink-updates
+          B=https://185.244.172.90.nip.io/updates
+          au=""; [ -f "artifacts/Rlink-${V}.apk" ]         && au="$B/Rlink-${V}.apk"
+          wu=""; [ -f "artifacts/rlink_${V}_windows.zip" ] && wu="$B/rlink_${V}_windows.zip"
+          mu=""; [ -f "artifacts/rlink_${V}_macos.zip" ]   && mu="$B/rlink_${V}_macos.zip"
+          jq -n --arg v "$V" --arg au "$au" --arg wu "$wu" --arg mu "$mu" '{
+            version:$v, notes:("Обновление "+$v), publishedAt:(now|todate),
+            assets:{android:$au, windows:$wu, macos:$mu, linux:"", web:$v}
+          }' > manifest.json
+          $SSH $HOST "mkdir -p $DIR"
+          for f in "Rlink-${V}.apk" "rlink_${V}_windows.zip" "rlink_${V}_macos.zip"; do
+            if [ -f "artifacts/$f" ]; then $SCP "artifacts/$f" "$HOST:$DIR/$f"; else echo "skip missing $f"; fi
+          done
+          $SCP manifest.json "$HOST:$DIR/manifest.json"
+          $SSH $HOST "cd $DIR && for f in Rlink-*.apk rlink_*_windows.zip rlink_*_macos.zip rlink_*_linux.tar.gz; do [ -e \"\$f\" ] || continue; case \"\$f\" in Rlink-${V}.apk|rlink_${V}_windows.zip|rlink_${V}_macos.zip|rlink_${V}_linux.tar.gz) : ;; *) rm -f \"\$f\" && echo \"removed old \$f\" ;; esac; done && chmod -R 755 $DIR && ls -lah $DIR"
+          echo "relay update published: $V"
