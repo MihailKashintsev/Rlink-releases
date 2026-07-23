@@ -1,15 +1,13 @@
 name: Release
 
-# Runs in the PUBLIC Rlink-releases repo (Actions are free for public repos —
-# the private Rlink repo hit a billing/spending-limit wall). It checks out the
-# app SOURCE from the PUBLIC rlink-web repo (same code, no token needed), builds
-# signed Android + Windows + macOS, and publishes them to THIS repo's release
-# (default GITHUB_TOKEN — no cross-repo PAT). The relay job mirrors the update.
+# Runs in the PUBLIC Rlink-releases repo (Actions are free for public repos).
+# Checks out app SOURCE from the PRIVATE Rlink repo using SOURCE_PAT secret.
+# Builds signed Android + Windows + macOS, publishes to THIS repo's release.
 #
-# Tag this repo `vX.Y.Z` to release. Make sure rlink-web@main is that version.
+# Tag this repo `vX.Y.Z` to release. Make sure Rlink@main is that version.
 #
 # Secrets: KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_PASSWORD, KEY_ALIAS (signing),
-# RELAY_SSH_KEY (relay mirror).
+# RELAY_SSH_KEY (relay mirror), SOURCE_PAT (read access to private Rlink repo).
 
 on:
   push:
@@ -20,7 +18,7 @@ permissions:
   contents: write
 
 env:
-  SRC_REPO: MihailKashintsev/rlink-web
+  SRC_REPO: MihailKashintsev/Rlink
   SRC_REF: main
 
 jobs:
@@ -32,6 +30,7 @@ jobs:
         with:
           repository: ${{ env.SRC_REPO }}
           ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SOURCE_PAT }}
       - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
@@ -63,7 +62,7 @@ jobs:
       - run: flutter pub get
       - name: Build AAB (RuStore)
         run: flutter build appbundle --release
-      - name: Build APKs (split per ABI — меньший файл под каждый процессор)
+      - name: Build APKs (split per ABI)
         run: flutter build apk --release --split-per-abi
       - name: Rename
         run: |
@@ -98,6 +97,7 @@ jobs:
         with:
           repository: ${{ env.SRC_REPO }}
           ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SOURCE_PAT }}
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.41.5'
@@ -145,6 +145,7 @@ jobs:
         with:
           repository: ${{ env.SRC_REPO }}
           ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SOURCE_PAT }}
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.41.5'
@@ -197,8 +198,6 @@ jobs:
           HOST=root@185.244.172.90
           DIR=/var/www/rlink-updates
           B=https://185.244.172.90.nip.io/updates
-          # android = arm64 (покрывает ~99% телефонов), android_arm32 — для старых
-          # 32-бит; апдейтер сам выбирает нужный по ABI устройства.
           au=""; [ -f "artifacts/Rlink-${V}-arm64.apk" ]   && au="$B/Rlink-${V}-arm64.apk"
           a32=""; [ -f "artifacts/Rlink-${V}-arm32.apk" ]  && a32="$B/Rlink-${V}-arm32.apk"
           wu=""; [ -f "artifacts/rlink_${V}_windows.zip" ] && wu="$B/rlink_${V}_windows.zip"
